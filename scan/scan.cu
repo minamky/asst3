@@ -27,6 +27,29 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void upsweep_kernal(int* data, int n) {
+    int idx = threadId.x + blockIdx.x * blockDim.x;
+
+    for (int i = 1; i < N; i *= 2){
+        if (idx % (2 * d) == 0) {
+            data[idx + 2 * i - 1] += data[idx + i - 1];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void downsweep_kernal(int* data, int n) {
+    int idx = threadId.x + blockIdx.x * blockDim.x;
+
+    for (int i = n / 2; i >= 1; i /= 2){
+        if (idx % (2 * i) == 0){
+            data[idx + i - 1] += data[idx + 2 * i - 1];
+            data[idx + 2 * i - 1] += data[idx + i - 1];
+        }
+        __syncthreads();
+    }
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -53,8 +76,24 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int* device_data;
+    cudaMalloc(&device_data, N * sizeof(int));
+    cudaMemcpy(device_data, input, N * sizeof(int), cudaMemcpyHostToDevice);
 
+    int num_blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
+    //upsweep phase 
+
+    upsweep_kernal<<<num_blocks, THREADS_PER_BLOCK>>> (device_data, N);
+    cudaDeviceSynchronize();
+    cudaMemset(device_data + n - 1, 0, sizeof(int));
+
+    //downsweep phase
+    downsweep_kernal<<<num_blocks, THREADS_PER_BLOCK>>> (device_data, N);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(result, device_data, sizeof(int) * N, cudaMemcpyDeviceToHost);
+    cudaFree(device_data);
 }
 
 
@@ -140,7 +179,6 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
-
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -160,6 +198,10 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    
+    // parallel exclusive prefix-sum
+
+
 
     return 0; 
 }
@@ -220,3 +262,4 @@ void printCudaInfo()
     }
     printf("---------------------------------------------------------\n"); 
 }
+
