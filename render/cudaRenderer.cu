@@ -14,9 +14,30 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#include "circleBoxTest.cu_inl"
+#define DEBUG
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", 
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
+#define SCAN_BLOCK_DIM 1024
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
+
 
 struct GlobalConstants {
 
@@ -31,6 +52,11 @@ struct GlobalConstants {
     int imageWidth;
     int imageHeight;
     float* imageData;
+    int maxCircleOverlap;
+    int numSectionsX;
+    int numSectionsY;
+    int numSections;
+    int sectionSize;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -427,6 +453,147 @@ __global__ void kernelRenderCircles() {
     }
 }
 
+__global__ void mixed_prerender_and_render() {
+    //First phase of the algorithm: identify which circles are roughly in the current section. One thread handles a subset of the sections.
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    int numCircles = cuConstRendererParams.numCircles;
+    int sectionSize = cuConstRendererParams.sectionSize;
+
+    float startX = (float)(blockIdx.x * sectionSize) / imageWidth;
+    float endX = (float)(min((blockIdx.x + 1) * sectionSize, imageWidth)) / imageWidth;
+    float startY = (float)(blockIdx.y * sectionSize) / imageHeight;
+    float endY = (float)(min((blockIdx.y + 1) * sectionSize, imageHeight)) / imageHeight;
+    
+    __shared__ uint exclusiveScanInput[SCAN_BLOCK_DIM];
+    __shared__ uint exclusiveScanOutput[SCAN_BLOCK_DIM];
+    __shared__ uint exclusiveScanScratch[2 * SCAN_BLOCK_DIM];
+    __shared__ int thisSectionCircleIndices[5000];
+    __shared__ int circlesPerSection;
+
+    int threadId = threadIdx.y * blockDim.x + threadIdx.x; //as specified in the exclusive scan comments
+    int localCircleIndices[128];
+    int thisThreadCirclesProcessed = 0;
+    
+    //divide up the number of circles amongst the threads
+    int circlesPerThread = (numCircles + SCAN_BLOCK_DIM - 1) / SCAN_BLOCK_DIM;
+    int startCircle = threadId * circlesPerThread;
+    int endCircle = min(startCircle + circlesPerThread, numCircles);
+
+    for (int i = startCircle; i < endCircle; i++) {
+        float3 position = *(float3*)(&cuConstRendererParams.position[3 * i]);
+        float radius = cuConstRendererParams.radius[i];
+        if (circleInBoxConservative(position.x, position.y, radius, startX, endX, endY, startY)) {
+            localCircleIndices[thisThreadCirclesProcessed] = i;
+            thisThreadCirclesProcessed++;
+        }
+    }
+    exclusiveScanInput[threadId] = thisThreadCirclesProcessed;
+    __syncthreads(); //need sync so all threads have written before you call exclusive scan otherwise summation will be incorrect
+    sharedMemExclusiveScan(threadId, exclusiveScanInput, exclusiveScanOutput, exclusiveScanScratch, SCAN_BLOCK_DIM);
+    __syncthreads(); //sync here so you have right accumulated values before writing 
+
+    int writePos = exclusiveScanOutput[threadId];
+    for (int i = 0; i < thisThreadCirclesProcessed; i++) {
+        //write each circle index to this section's shared array
+        thisSectionCircleIndices[writePos + i] = localCircleIndices[i];
+    }
+
+    if (threadId == 0) {
+        //identify the number of circles in this section
+        circlesPerSection = exclusiveScanOutput[SCAN_BLOCK_DIM - 1] + exclusiveScanInput[SCAN_BLOCK_DIM - 1];
+    }
+    __syncthreads();
+
+    //Now in the second phase. We need to shade each pixel in the section. Now instead of handling a subset of circles, each thread handles a singular pixel.
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                                            invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+    float3 rgb;
+    float alpha;
+    float4 existingColor = make_float4(1.f, 1.f, 1.f, 0.f);
+    //set background depending on whether the scene is snowflakes or not
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        float shade = .4f + .45f * static_cast<float>(imageHeight-pixelY) / imageHeight;
+        existingColor = make_float4(shade, shade, shade, 1.f);
+    } else {
+        existingColor = make_float4(1.f, 1.f, 1.f, 0.f);
+    }
+    
+    //bounding box computation
+    float boxL = invWidth * pixelX;
+    float boxR = invWidth * (pixelX + 1);
+    float boxB = invHeight * pixelY;
+    float boxT = invHeight * (pixelY + 1);
+    
+    if (cuConstRendererParams.sceneName != SNOWFLAKES && cuConstRendererParams.sceneName != SNOWFLAKES_SINGLE_FRAME) {
+        for (int i = 0; i < circlesPerSection; i++) {
+            int circleIndex = thisSectionCircleIndices[i];
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            if (circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
+                if (pixelDist <= rad * rad) {
+                    rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+                    alpha = .5f;
+                    float oneMinusAlpha = 1.f - alpha;
+                    existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+                    existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+                    existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+                    existingColor.w = alpha + existingColor.w;
+                }
+            }
+        }
+    }
+
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+        for (int i = 0; i < circlesPerSection; i++) {
+            int circleIndex = thisSectionCircleIndices[i];
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            if (circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
+                if (pixelDist <= rad * rad) {
+                        
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloffScale = 4.f;
+
+                    float normPixelDist = sqrt(pixelDist) / rad;
+                    rgb = lookupColor(normPixelDist);
+
+                    float maxAlpha = .6f + .4f * (1.f-p.z);
+                    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+                    alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+                      
+                    float oneMinusAlpha = 1.f - alpha;
+                    existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+                    existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+                    existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+                    existingColor.w = alpha + existingColor.w;
+                }
+            }
+        }
+    }
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + pixelX)]);
+    *imgPtr = existingColor;
+}
+
+
+
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -531,6 +698,14 @@ CudaRenderer::setup() {
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceRadius, radius, sizeof(float) * numCircles, cudaMemcpyHostToDevice);
 
+    int sectionSize = 32;
+    int numSectionsX = (image->width + sectionSize - 1) / sectionSize;
+    int numSectionsY = (image->height + sectionSize - 1) / sectionSize;
+    int numSections = numSectionsX * numSectionsY;
+    int maxCircleOverlap = 5000; //change to 2000 if want working no OOM
+
+
+
     // Initialize parameters in constant memory.  We didn't talk about
     // constant memory in class, but the use of read-only constant
     // memory here is an optimization over just sticking these values
@@ -549,6 +724,11 @@ CudaRenderer::setup() {
     params.color = cudaDeviceColor;
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
+    params.maxCircleOverlap = maxCircleOverlap;
+    params.numSectionsX = numSectionsX;
+    params.numSectionsY = numSectionsY;
+    params.numSections = numSections;
+    params.sectionSize = sectionSize;
 
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
@@ -561,6 +741,8 @@ CudaRenderer::setup() {
     cudaMemcpyToSymbol(cuConstNoiseXPermutationTable, permX, sizeof(int) * 256);
     cudaMemcpyToSymbol(cuConstNoiseYPermutationTable, permY, sizeof(int) * 256);
     cudaMemcpyToSymbol(cuConstNoise1DValueTable, value1D, sizeof(float) * 256);
+    cudaDeviceSynchronize();
+
 
     // last, copy over the color table that's used by the shading
     // function for circles in the snowflake demo
@@ -633,13 +815,12 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
-void
-CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+void CudaRenderer::render() {
+    //processing in a 2D grid because we have 2D image and then each thread can easily have an (x,y) coordinate
+    int sectionSize = 32;
+    int numSectionsX = (image->width + sectionSize - 1) / sectionSize;
+    int numSectionsY = (image->height + sectionSize - 1) / sectionSize;
+    dim3 prerenderBlockDim(sectionSize, sectionSize, 1);
+    dim3 prerenderGridDim(numSectionsX, numSectionsY);
+    mixed_prerender_and_render<<<prerenderGridDim, prerenderBlockDim>>>();
 }
